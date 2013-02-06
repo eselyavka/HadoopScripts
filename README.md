@@ -29,7 +29,7 @@ It should be noted that in Apache 1.0/CDH3 the NameNode stores only one fsimage 
 With Apache 2.0/CDH4, the NameNode now stores multiple fsimage and edits files to aid recovery, this complicates things somewhat. The new method of retrieving the files is as follows:
 
     fsimage: http://<namenode>:50070/getimage?getimage=1&txid=latest
-    edits: http://<namdenode>:50070/getimage?getedit=1&startTxId=X&endTxID=Y
+    edits: http://<namdenode>:50070/getimage?getedit=1&startTxId=X&endTxId=Y
 
 Where X and Y are the starting and ending transcation IDs. In release 2.0 the dfs.name.dir or dfs.namenode.name.dir directory will contain multiple fsimages:
     fsimage_0000000000000003100
