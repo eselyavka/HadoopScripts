@@ -20,17 +20,21 @@ import re
 import os
 import datetime
 import hashlib
-
+import tarfile
 
 ''' TODO
 1. Allow command line specified backup directory path 
-2. Discover NameNode IP and port from config file, but this assumes the script is running on a cluster node or that a local copy of the configuration files are present
+2. Discover NameNode IP and port from config file, but this assumes the script is running on a cluster node or that a local copy of the configuration files are present (DONE)
 3. Modify script to handle both Apache Hadoop 1.0/CDH3 and Apache Hadoop 2.0/CDH4 method of retrieving the metadata files  
     a) Modify the script to allow user specified txid for fsimage rather than always retrieving the latest version
-    b) Improve error handling of command line options, i.e. an --endTxId option specified with --getimage makes no sense
+    b) Improve error handling of command line options, i.e. an --endTxId option specified with --getimage makes no sense (DONE)
 5. Add support for incremental backups of edits file:  
     a) Write backup info to a log file then use it to determine the last transaction range that was last backed up for the edits file
     b) Alternatively we could just parse the file name of the last edits file backup
+6. Add support for compressing metadata files
+    a) Write function for compressing files (DONE)
+    b) Add parameter to enable compression
+7. Move code for retrieving fsimage and edits files into separate functions rather than in main body.
 '''
 
 def isValidIPAddress(address):
@@ -53,6 +57,31 @@ def isValidPort(port):
     else:
         return False
 
+def getVersion(host,port):
+    '''Return the version/release of Hadoop that the NameNode is running'''
+    nnHomePage = 'http://'+host+':'+port+'/'+'dfshealth.jsp' 
+    request = urllib2.urlopen(nnHomePage)
+    page = request.read()
+    
+    match = re.search(r'(Version:</td><td>)(.*),', page)
+    if match:
+        version =  match.group(2)        
+        if re.search(r'2.[0-9]', version):
+            return "Apache Hadoop 2.0"
+        elif re.search(r'1.[0-9]', version):
+            return "Apache Hadoop 1.0"
+
+def isVersionMismatch(reportedVersion, actualVersion):
+    '''Returns True if the version of Hadoop specified on the command line does not match the version of Hadoop reported by the server (extracted from the NameNode web interface)'''
+    if reportedVersion == 1.0:
+        reportedVersion = 'Apache Hadoop 1.0'
+    elif reportedVersion == 2.0:
+        reportedVersion = 'Apache Hadoop 2.0'
+    
+    if reportedVersion == actualVersion:
+        return False
+    return True
+            
 def timestamp(format='%Y-%m-%d-%H-%M-%S'):
     ''' Returns a timestamp in the format YYY-MM-DD-HH-MM-SS to be used to name our backup files '''
     return datetime.datetime.now().strftime(format)
@@ -61,7 +90,7 @@ def dlProgress(block_count, block_size, total_size):
     total_kb = total_size/1024
     print "%d kb of %d kb downloaded" %(block_count * (block_size/1024),total_kb )
 
-def downloadFile(URL,fileDest,fileMode='700'):
+def downloadFile(URL,fileDest,fileMode='600'):
     ''' Function for downloading / fetching the fsimage and edits files '''
     try:
         remote_file = urllib2.urlopen(URL)
@@ -86,6 +115,20 @@ def downloadFile(URL,fileDest,fileMode='700'):
     else:
         return True
 
+def compressFile(filepath):
+    print "Creating archive..."
+    out = tarfile.open(filepath+'.tar.gz', mode='w:gz')
+    try:
+        basename = os.path.basename(filepath)
+        out.add(filepath,arcname=basename)
+        out.add(filepath+'.sha1',arcname=basename+'.sha1')
+        print "Archive created, deleting original files..."
+        #os.remove(filepath)
+        #os.remove(filepath+'.sha1')
+        print "Finished deleting files, backup complete."
+    finally:
+        out.close()
+    
 scriptUsage = """
 %prog -s HOSTNAME | -i IP -r RELEASE [-p PORT] --ACTION --getimage | getedits [SUBOPTIONS]
 
@@ -130,15 +173,14 @@ if __name__ == "__main__":
 
     # Location where backups will be stored
     backupDir = '/backup/hdfs'
-
+    
     if not os.path.exists(backupDir):
         print "Error: the backup directory %s does not exist. Please create this directory or modify the backupDir variable.\n" % backupDir
         sys.exit(1)
     if not os.access(backupDir, os.W_OK):
         print "Error: the backup directory %s is not writable by the user (%s) executing this script.\n" % (backupDir,os.getlogin())
         sys.exit(1)
-
-
+    
     nnURL = 'http://' 
     hostOrIP = ''
 
@@ -166,8 +208,14 @@ if __name__ == "__main__":
 
 
     nnURL += hostOrIP + ':' + str(options.namenode_port)
-
-
+    
+    
+    HadoopRelease = getVersion(hostOrIP,str(options.namenode_port))
+    if isVersionMismatch(options.release,HadoopRelease):
+        print "\nError: ",options.release," was specified via the -r paremeter, however, server reports it is running: ",HadoopRelease
+        print scriptUsage
+        sys.exit(1)
+    
     if options.getimage:
         if options.release == 1:
             nnURL += '/getimage?getimage=1'
@@ -181,10 +229,12 @@ if __name__ == "__main__":
         print "Backup file will be written to: %s.\n" % backupFilename
         if downloadFile(nnURL, backupFilename):
             print "File successfully downloaded and written to backup directory."
+            
             fileHash = hashlib.sha1(open(backupFilename,'rb').read()).hexdigest()
             with open (backupFilename + '.sha1','a') as f: f.write(fileHash)
             
             print "Hash (%s) of file written to: %s\n" % (fileHash,backupFilename)
+            compressFile(backupFilename)
         else:
             print "Error: Could not retrieve the fsimage file; exiting script."
             sys.exit(1)
@@ -201,16 +251,19 @@ if __name__ == "__main__":
                 nnURL += '/getimage?getedit=1&startTxId=%s&endTxId=%s' % (options.startTxId, options.endTxId) 
             
             print "Attempting to retrieve edits file from:\n%s" % nnURL
-             
+            
             backupFilename = backupDir + '/' + 'edits-' + options.startTxId + '-' + options.endTxId + '-' + hostOrIP + '-' + timestamp()
 
             print "Backup file will be written to: %s\n" % backupFilename
             if downloadFile(nnURL, backupFilename):
                 print "File successfully downloaded and written to backup directory."
+                
                 fileHash = hashlib.sha1(open(backupFilename,'rb').read()).hexdigest()
                 with open (backupFilename + '.sha1','a') as f: f.write(fileHash)
                 
                 print "Hash (%s) of file written to: %s\n" % (fileHash,backupFilename)
+                compressFile(backupFilename)
+
             else:
                 print "Error: Could not retrieve the fsimage file; exiting script."
                 sys.exit(1)
