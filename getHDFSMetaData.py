@@ -21,6 +21,7 @@ import os
 import datetime
 import hashlib
 import tarfile
+import time
 
 ''' TODO
 1. Allow command line specified backup directory path 
@@ -128,7 +129,29 @@ def compressFile(filepath):
         print "Finished deleting files, backup complete."
     finally:
         out.close()
-    
+
+def getEditsTransactionNumber(editsFilePath, timeDelta):
+    print "Try to find out startTxId and endTxId"    
+
+    if not os.path.exists(editsFilePath):
+        print "Error: the edits directory %s does not exist. Can't determinate startTxId and endTxId.\n" % editsFilePath
+        return False
+    if not os.access(editsFilePath, os.R_OK):
+        print "Error: the edits directory %s is not readable by the user (%s) executing this script. Can't determinate startTxId and endTxId.\n" % (editsFilePath,os.getlogin())
+        return False
+    if not timeDelta.isdigit():
+         print "Error: time delta %s contains non digit characters.\n" % timeDelta
+         return timeDelta.isdigit()
+    interval = int(time.time()-int(timeDelta))
+    editsDict = {}
+    for file in os.listdir(editsFilePath):
+        matchEditFile = re.match(r'^edits_(.*)\-(.*)', file, re.M|re.I)
+        if matchEditFile:
+            fileMtime = int(os.stat(editsFilePath + '/' + matchEditFile.group()).st_mtime)
+            if ( fileMtime >= interval ):
+                 editsDict[matchEditFile.group()] = matchEditFile.group(1) + ';' + matchEditFile.group(2)
+    return editsDict                  
+        
 scriptUsage = """
 %prog -s HOSTNAME | -i IP -r RELEASE [-p PORT] --ACTION --getimage | getedits [SUBOPTIONS]
 
@@ -161,8 +184,7 @@ if __name__ == "__main__":
 
     #print options
     #print args
-
-
+   
     if (options.namenode_host is None) and (options.namenode_ip is None) or (options.release is None):
         parser.error("Wrong number of arguements. You must at least specify the NameNode IP address or hostname AND the release AND the getimage or getedits parameters.\n")
         print scriptUsage
@@ -172,8 +194,12 @@ if __name__ == "__main__":
 
 
     # Location where backups will be stored
-    backupDir = '/backup/hdfs'
+    backupDir = '/tmp/hadoop.backup'
     
+    # Location where edits stored and time delta for retrieving edits file
+    editsFilePath = '/hadoop/namenode/dfs/sn/current/'
+    timeDelta = '86400' # seconds
+
     if not os.path.exists(backupDir):
         print "Error: the backup directory %s does not exist. Please create this directory or modify the backupDir variable.\n" % backupDir
         sys.exit(1)
@@ -242,29 +268,93 @@ if __name__ == "__main__":
 
     if options.getedits:
         if (options.startTxId is None) or (options.endTxId is None):
-            print "Error: The --getedits option was specified, this requires the --startTxId and --endTxId are also specified.\n"
-            print scriptUsage
-        else:
+            nnURL += '/getimage?getedit=1'
             if options.release == 1:
-                nnURL += '/getimage?getedit=1'
-            else:
-                nnURL += '/getimage?getedit=1&startTxId=%s&endTxId=%s' % (options.startTxId, options.endTxId) 
-            
-            print "Attempting to retrieve edits file from:\n%s" % nnURL
-            
-            backupFilename = backupDir + '/' + 'edits-' + options.startTxId + '-' + options.endTxId + '-' + hostOrIP + '-' + timestamp()
-
-            print "Backup file will be written to: %s\n" % backupFilename
-            if downloadFile(nnURL, backupFilename):
-                print "File successfully downloaded and written to backup directory."
+                backupFilename = backupDir + '/' + 'edits-' + '-' + hostOrIP + '-' + timestamp()
                 
-                fileHash = hashlib.sha1(open(backupFilename,'rb').read()).hexdigest()
-                with open (backupFilename + '.sha1','a') as f: f.write(fileHash)
+                print "Attempting to retrieve edits file from:\n%s" % nnURL
+
+                print "Backup file will be written to: %s\n" % backupFilename
+ 
+                if downloadFile(nnURL, backupFilename):
+                    print "File successfully downloaded and written to backup directory."
                 
-                print "Hash (%s) of file written to: %s\n" % (fileHash,backupFilename)
-                compressFile(backupFilename)
+                    fileHash = hashlib.sha1(open(backupFilename,'rb').read()).hexdigest()
+                    with open (backupFilename + '.sha1','a') as f: f.write(fileHash)
+                
+                    print "Hash (%s) of file written to: %s\n" % (fileHash,backupFilename)
+                    compressFile(backupFilename)
 
+                else:
+                    print "Error: Could not retrieve the edits file; exiting script."
+                    sys.exit(1)
             else:
-                print "Error: Could not retrieve the fsimage file; exiting script."
-                sys.exit(1)
+                editsDict = getEditsTransactionNumber(editsFilePath, timeDelta)
+                if editsDict:
+                    for editsFile in editsDict.keys():
+                        nnUrlVar = nnURL
+                        editsArr = editsDict[editsFile].split(';')
+                        nnUrlVar += '&startTxId=%s&endTxId=%s' % (editsArr[0], editsArr[1])
+                        
+                        print "Attempting to retrieve edits file from:\n%s" % nnUrlVar
+        
+                        backupFilename = backupDir + '/' + 'edits-' + editsArr[0] + '-' + editsArr[1] + '-' + hostOrIP + '-' + timestamp()
+                        
+                        print "Backup file will be written to: %s\n" % backupFilename
+ 
+                        if downloadFile(nnUrlVar, backupFilename):
+                            print "File successfully downloaded and written to backup directory."
+                
+                            fileHash = hashlib.sha1(open(backupFilename,'rb').read()).hexdigest()
+                            with open (backupFilename + '.sha1','a') as f: f.write(fileHash)
+                
+                            print "Hash (%s) of file written to: %s\n" % (fileHash,backupFilename)
+                            compressFile(backupFilename)
 
+                        else:
+                            print "Error: Could not retrieve the fsimage file; exiting script."
+                            sys.exit(1)
+                else:
+                    print "Error: The --getedits option was specified, this requires the --startTxId and --endTxId are also specified.\n"
+                    print scriptUsage
+        else:
+            nnURL += '/getimage?getedit=1'
+            if options.release == 1:
+                backupFilename = backupDir + '/' + 'edits-' + '-' + hostOrIP + '-' + timestamp()
+                
+                print "Attempting to retrieve edits file from:\n%s" % nnURL
+
+                print "Backup file will be written to: %s\n" % backupFilename
+ 
+                if downloadFile(nnURL, backupFilename):
+                    print "File successfully downloaded and written to backup directory."
+                
+                    fileHash = hashlib.sha1(open(backupFilename,'rb').read()).hexdigest()
+                    with open (backupFilename + '.sha1','a') as f: f.write(fileHash)
+                
+                    print "Hash (%s) of file written to: %s\n" % (fileHash,backupFilename)
+                    compressFile(backupFilename)
+
+                else:
+                    print "Error: Could not retrieve the edits file; exiting script."
+                    sys.exit(1)
+            else:
+                nnURL += '&startTxId=%s&endTxId=%s' % (options.startTxId, options.endTxId) 
+            
+                print "Attempting to retrieve edits file from:\n%s" % nnURL
+            
+                backupFilename = backupDir + '/' + 'edits-' + options.startTxId + '-' + options.endTxId + '-' + hostOrIP + '-' + timestamp()
+ 
+                print "Backup file will be written to: %s\n" % backupFilename
+                if downloadFile(nnURL, backupFilename):
+                    print "File successfully downloaded and written to backup directory."
+                
+                    fileHash = hashlib.sha1(open(backupFilename,'rb').read()).hexdigest()
+                    with open (backupFilename + '.sha1','a') as f: f.write(fileHash)
+                 
+                    print "Hash (%s) of file written to: %s\n" % (fileHash,backupFilename)
+                    compressFile(backupFilename)
+
+                else:
+                    print "Error: Could not retrieve the edits file; exiting script."
+                    sys.exit(1)
